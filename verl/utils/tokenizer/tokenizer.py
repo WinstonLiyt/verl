@@ -134,6 +134,22 @@ def build_multimodal_processor_inputs(
     return processor(**processor_inputs)
 
 
+def _check_special_mm_tokens_on_lists(self, text, text_inputs, modalities):
+    """Run ``ProcessorMixin._check_special_mm_tokens`` on ``input_ids`` converted to Python lists.
+
+    Before transformers 5.15.0 the check counts special tokens with ``list(ids).count(token_id)``
+    on tensors, which compares one scalar tensor at a time and costs ~0.5 s for a 128K-token prompt
+    even when it has no image or video. huggingface/transformers#47580 converts ``input_ids`` with
+    ``tolist()`` first; this backports that fix for the pinned transformers version.
+    """
+    from transformers import ProcessorMixin
+
+    input_ids = text_inputs["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        text_inputs = {"input_ids": input_ids.tolist()}
+    return ProcessorMixin._check_special_mm_tokens(self, text, text_inputs, modalities)
+
+
 def set_pad_token_id(tokenizer):
     """Set pad_token_id to eos_token_id if it is None.
 
@@ -190,7 +206,9 @@ def hf_processor(name_or_path, **kwargs):
         Returns ``None`` for text-only models (including AutoProcessor fallbacks to
         tokenizer backends such as ``TokenizersBackend``).
     """
-    from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
+    from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
+
+    from verl.utils.transformers_compat import is_transformers_version_in_range
 
     try:
         processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
@@ -234,6 +252,13 @@ def hf_processor(name_or_path, **kwargs):
                 processor.validate_inputs = lambda *args, **kwargs: None
             case _:
                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
+
+        # Backport huggingface/transformers#47580, unless the processor class overrides the check.
+        if (
+            not is_transformers_version_in_range(min_version="5.15.0")
+            and type(processor)._check_special_mm_tokens is ProcessorMixin._check_special_mm_tokens
+        ):
+            processor._check_special_mm_tokens = types.MethodType(_check_special_mm_tokens_on_lists, processor)
 
         if model_class is not None:
             processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)
